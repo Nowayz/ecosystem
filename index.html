@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Biofluid SPA</title>
+  <style>
+    /* Full-viewport canvas with no scrollbars. */
+    html,
+    body,
+    canvas {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #000;
+      overflow: hidden;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <script type="module">
+    /*
+      This page is a single-page WebGPU simulation:
+      - 3 compute stages update fluid, particle ownership, and dye.
+      - 1 render stage composites the final image to the canvas.
+      - Ping/pong textures preserve state between frames.
+    */
+
+    const canvas = document.getElementById("c");
+    const math = Math;
+
+    // Canvas and dispatch sizing.
+    let canvasWidth = 0;
+    let canvasHeight = 0;
+    let workgroupsX = 1;
+    let workgroupsY = 1;
+
+    // Two 4-layer state textures used in ping/pong mode.
+    let layeredTextures = [];
+    let previousTextureWidth = 0;
+    let previousTextureHeight = 0;
+    let pingPongIndex = 0;
+
+    // Per-frame counters and bind-group caches.
+    let frameIndex = 0;
+    let frameBindSets = [];
+
+    (async () => {
+      // WebGPU bootstrap.
+      const gpu = navigator.gpu;
+      const adapter = await gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+      const queue = device.queue;
+
+      const context = canvas.getContext("webgpu");
+      const canvasFormat = gpu.getPreferredCanvasFormat();
+      context.configure({
+        device,
+        format: canvasFormat,
+        alphaMode: "premultiplied",
+      });
+
+      /*
+        WGSL shader module organization:
+        - `fF`: Fluid integration / force update.
+        - `fP`: Particle ownership update and seeding.
+        - `fD`: Dye/color advection and diffusion.
+        - `vs` + `fs`: Full-screen pass to display the simulation.
+
+        Texture slot convention (array layer meaning):
+        - Layer 0: flow / velocity-like field
+        - Layer 1: particle field
+        - Layer 2: display color field
+        - Layer 3: previous color field (used by dye stage)
+      */
+      const shaderCode = `
+struct U {
+  // m.xy = pointer position in pixels, m.z = pointer-down flag.
+  m: vec4f,
+  // f = frame index.
+  f: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var t1: texture_2d<f32>;
+@group(0) @binding(2) var t2: texture_2d<f32>;
+@group(0) @binding(3) var t3: texture_2d<f32>;
+@group(0) @binding(4) var t4: texture_2d<f32>;
+@group(0) @binding(5) var o1: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(6) var o2: texture_storage_2d<rgba32float, write>;
+
+// Hash-like deterministic pseudo-random vector in [-1, 1].
+fn H(p: f32) -> vec4f {
+  var v = fract(vec4f(p) * vec4f(.1031, .1030, .0973, .1099));
+  v += dot(v, v.wzxy + 19.19);
+  return fract((v.xxyz + v.yzzw) * v.zywx) * 2. - 1.;
+}
+
+// Sparse random event gate used for occasional "special" particles.
+fn R(s: f32) -> bool {
+  return fract(s * 97.13) > .985;
+}
+
+// Clamp-safe load for integer texel coordinates.
+fn L(t: texture_2d<f32>, p: vec2i) -> vec4f {
+  return textureLoad(
+    t,
+    clamp(p, vec2i(0), vec2i(textureDimensions(t)) - 1),
+    0
+  );
+}
+
+// Bilinear sample helper in pixel space (expects center-based coordinates).
+fn cS(t: texture_2d<f32>, P: vec2f) -> vec4f {
+  let p = P - .5;
+  let i = vec2i(floor(p));
+  let f = fract(p);
+  return mix(
+    mix(L(t, i), L(t, i + vec2i(1, 0)), f.x),
+    mix(L(t, i + vec2i(0, 1)), L(t, i + vec2i(1, 1)), f.x),
+    f.y
+  );
+}
+
+// Semi-Lagrangian advection step: sample from backtraced coordinates.
+fn T(t: texture_2d<f32>, U: vec2f) -> vec4f {
+  return cS(t, U - cS(t, U).xy);
+}
+
+// Stable integer hash in [0, 1] used for grid-based seeding.
+fn hS(p: vec2i) -> f32 {
+  var n = u32(p.x) * 374761393u + u32(p.y) * 668265263u;
+  n = (n ^ (n >> 13u)) * 1274126177u;
+  return f32(n ^ (n >> 16u)) / 4294967295.;
+}
+
+// Time-varying diffusion direction tied to particle id + position + frame index.
+// This intentionally de-synchronizes motion so clusters do not all drift the same way.
+fn pD(seed: f32, pos: vec2f, frame: u32) -> vec2f {
+  let h = H(seed);
+  let axis = normalize(h.xy + vec2f(1e-5, -1e-5));
+  let speed = .018 + .028 * abs(h.z);
+  let freq = .035 + .055 * abs(h.w);
+  let phase = dot(pos, axis * freq) + f32(frame) * speed + h.x * 6.2831853;
+  let wave = vec2f(cos(phase), sin(phase));
+  let cross = vec2f(-axis.y, axis.x) * sin(phase * .73 + h.y * 4.2);
+  return normalize(wave + .65 * cross + axis * .25);
+}
+
+// Compute stage 1: evolve the primary flow field.
+@compute @workgroup_size(16, 16)
+fn fF(@builtin(global_invocation_id) g: vec3u) {
+  let d = textureDimensions(t1);
+  if (g.x >= d.x || g.y >= d.y) {
+    return;
+  }
+
+  let i = vec2i(g.xy);
+  let U = vec2f(g.xy) + .5;
+
+  // Neighbor samples of advected field.
+  let n = T(t1, U + vec2f(0, 1));
+  let e = T(t1, U + vec2f(1, 0));
+  let s = T(t1, U - vec2f(0, 1));
+  let w = T(t1, U - vec2f(1, 0));
+  var Q = T(t1, U);
+
+  // Flow update with coupled terms.
+  Q.x -= .2501 * (e.z - w.z - Q.w * (n.w - s.w));
+  Q.y -= .2501 * (n.z - s.z - Q.w * (e.w - w.w));
+  Q.z += .2501 * (s.y - n.y + w.x - e.x + n.z + e.z + s.z + w.z) - Q.z;
+  Q.w += .25 * (s.x - n.x + w.y - e.y) - Q.w;
+  Q = vec4f(Q.xy * 1.000751, Q.zw);
+
+  // Soft clamp against runaway states.
+  if (abs(Q.z + Q.w + Q.x + Q.y) > 2.) {
+    Q *= .1;
+  }
+
+  // Couple flow to nearby particles and dye gradients.
+  let b = cS(t2, U);
+  let h = H(b.w);
+
+  let hn = cS(t3, U + vec2f(0, 1));
+  let he = cS(t3, U + vec2f(1, 0));
+  let hs = cS(t3, U - vec2f(0, 1));
+  let hw = cS(t3, U - vec2f(1, 0));
+  let v = mat4x2f(
+    he.x - hw.x, hn.x - hs.x,
+    he.y - hw.y, hn.y - hs.y,
+    he.z - hw.z, hn.z - hs.z,
+    he.w - hw.w, hn.w - hs.w
+  ) * h;
+
+  let blend = smoothstep(1.3, 1e-8, length(U - b.xy));
+  if (R(b.w)) {
+    Q += vec4f(v * blend * 1.35, .001, 0);
+  } else {
+    Q += vec4f(v * blend, 0, 0);
+  }
+
+  // Keep borders and first frame stable.
+  if (U.x < 1. || U.y < 1. || f32(d.x) - U.x < 1. || f32(d.y) - U.y < 1. || u.f < 1u) {
+    Q = vec4f(0, 0, Q.z, 0);
+  }
+
+  // Mouse input injects directional force in a small radius.
+  if (u.m.z > 0. && length(U - u.m.xy) < 20.) {
+    Q += vec4f(
+      normalize(U - u.m.xy + vec2f(1e-5, 0)) * (.45 * smoothstep(20., 0., length(U - u.m.xy))),
+      0,
+      0
+    );
+  }
+
+  textureStore(o1, i, Q);
+}
+
+// Compute stage 2: update particle ownership/identity and spawn new seeds.
+@compute @workgroup_size(16, 16)
+fn fP(@builtin(global_invocation_id) g: vec3u) {
+  let d = textureDimensions(t2);
+  if (g.x >= d.x || g.y >= d.y) {
+    return;
+  }
+
+  let i = vec2i(g.xy);
+  let U = vec2f(g.xy) + .5;
+  var Q = cS(t2, U);
+
+  // Pick the nearest candidate owner from a small neighborhood stencil.
+  let O = array(
+    vec2f(1, 0),
+    vec2f(0, 1),
+    vec2f(-1, 0),
+    vec2f(0, -1),
+    vec2f(2, 2),
+    vec2f(2, -2),
+    vec2f(-2, 2),
+    vec2f(-2, -2)
+  );
+  for (var j = 0; j < 8; j++) {
+    let n = cS(t2, U + O[j]);
+    if (distance(U, n.xy) < distance(U, Q.xy)) {
+      Q = n;
+    }
+  }
+
+  // Re-randomize identity if appearance becomes too similar to local dye.
+  if (length(H(Q.w) - cS(t3, U)) < .1) {
+    Q.w = dot(H(Q.w), vec4f(1e3));
+  }
+
+  // Move ownership forward by the fluid field.
+  // A subset of particles also gets directional diffusion for less repetitive paths.
+  let baseFlow = cS(t1, mix(U, Q.xy, .7)).xy;
+  let idHash = H(Q.w);
+  let diffuseMask = select(
+    0.,
+    1.,
+    fract(abs(idHash.x) * 91.73 + abs(idHash.z) * 47.11) > .38
+  );
+  let diffusionVector = pD(Q.w, U, u.f);
+  let flowScale = .75 + 1.15 * smoothstep(.02, .45, length(baseFlow));
+  let diffusionStrength = (.03 + .085 * abs(idHash.w)) * diffuseMask * flowScale;
+
+  // Bias a broad subset of particles to drift from bottom-left toward top-right.
+  let diagonalDirection = normalize(vec2f(1., -1.));
+  let diagonalMask = select(
+    0.,
+    1.,
+    fract(abs(idHash.y) * 73.1 + abs(idHash.w) * 31.7) > .33
+  );
+  let diagonalPulse = .35 + .65 * (.5 + .5 * sin(dot(U, vec2f(.0105, -.0085)) + f32(u.f) * .019 + idHash.y * 3.7));
+  let diagonalStrength = (.022 + .075 * abs(idHash.x)) * diagonalMask * diagonalPulse;
+
+  Q += vec4f(baseFlow + diffusionVector * diffusionStrength + diagonalDirection * diagonalStrength, 0, 0);
+
+  // Seed particle IDs on startup; later, mouse drag can inject new IDs.
+  if (u.f < 1u) {
+    let C = i / 32;
+    let D = hS(C);
+    if (D < .01024) {
+      if (
+        i.x == clamp(C.x * 32 + i32(hS(C + vec2i(17, 29)) * 32.), 0, i32(d.x) - 1) &&
+        i.y == clamp(C.y * 32 + i32(hS(C + vec2i(71, 97)) * 32.), 0, i32(d.y) - 1)
+      ) {
+        Q = vec4f(U, 0, dot(H(D), vec4f(1e3)));
+      }
+    }
+  } else if (u.m.z > 0. && length(u.m.xy - U) < 8.) {
+    Q = vec4f(U, 0, dot(H(hS(i)), vec4f(1e3)));
+  }
+
+  // Special particles receive additional swirl + emissive behavior.
+  if (R(Q.w)) {
+    Q += vec4f(normalize(H(Q.w).yz - .5) * .08, .004 * length(cS(t3, U).xyz), .002);
+  }
+
+  textureStore(o1, i, Q);
+}
+
+// Shared helper for dye advection/diffusion.
+fn dC(t: texture_2d<f32>, U: vec2f, b: vec4f) -> vec4f {
+  var q = cS(t, U);
+  return mix(
+    q,
+    .25 * (
+      cS(t, U + vec2f(0, 1)) +
+      cS(t, U + vec2f(1, 0)) +
+      cS(t, U - vec2f(0, 1)) +
+      cS(t, U - vec2f(1, 0))
+    ),
+    vec4f(.4, .6, .8, 1.)
+  ) + .1 * (H(b.w) - q) * smoothstep(1., 0., length(b.xy - U));
+}
+
+// Compute stage 3: advect current and previous dye buffers.
+@compute @workgroup_size(16, 16)
+fn fD(@builtin(global_invocation_id) g: vec3u) {
+  let d = textureDimensions(t3);
+  if (g.x >= d.x || g.y >= d.y) {
+    return;
+  }
+
+  let i = vec2i(g.xy);
+  let c = vec2f(g.xy) + .5;
+  let b = cS(t1, c);
+  let U = c - .5 * cS(t2, c).xy;
+
+  var qD = dC(t3, U, b);
+  var qC = dC(t4, U, b);
+  if (u.f < 1u) {
+    qD = vec4f(0);
+    qC = vec4f(0);
+  }
+
+  textureStore(o1, i, qD);
+  textureStore(o2, i, qC);
+}
+
+// Full-screen triangle vertex shader.
+@vertex
+fn vs(@builtin(vertex_index) v: u32) -> @builtin(position) vec4f {
+  return vec4f(
+    f32((v << 1u) & 2u) * 2. - 1.,
+    f32(v & 2u) * 2. - 1.,
+    0,
+    1
+  );
+}
+
+// Composite pass from simulation fields to final display color.
+@fragment
+fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let P = vec2i(p.xy);
+  let d = textureDimensions(t1);
+  if (d.x > 4 && d.y > 4 && (P.x < 2 || P.y < 2 || P.x >= i32(d.x) - 2 || P.y >= i32(d.y) - 2)) {
+    return vec4f(0);
+  }
+
+  let b = textureLoad(t1, P, 0);
+  var q = smoothstep(2., 0., length(b.xy - (vec2f(P) + .5))) * (.5 + 2. * H(b.w)) + textureLoad(t2, P, 0).yzwx;
+
+  if (R(b.w)) {
+    q += vec4f(.22, .12, .02, 0);
+  }
+  if (u.m.z > 0.) {
+    q += vec4f(.18, .12, .06, 0) * smoothstep(10., 0., length((vec2f(P) + .5) - u.m.xy));
+  }
+
+  return vec4f(q.xyz, 1);
+}
+`;
+
+      const shaderModule = device.createShaderModule({ code: shaderCode });
+
+      // Helper to build compute pipelines from a shader entry point.
+      const createComputePipeline = (entryPoint) =>
+        device.createComputePipeline({
+          layout: "auto",
+          compute: { module: shaderModule, entryPoint },
+        });
+
+      const flowPipeline = createComputePipeline("fF");
+      const particlePipeline = createComputePipeline("fP");
+      const dyePipeline = createComputePipeline("fD");
+
+      const renderPipeline = device.createRenderPipeline({
+        layout: "auto",
+        vertex: { module: shaderModule, entryPoint: "vs" },
+        fragment: {
+          module: shaderModule,
+          entryPoint: "fs",
+          targets: [{ format: canvasFormat }],
+        },
+        primitive: { topology: "triangle-list" },
+      });
+
+      // Creates a 2D texture with 4 array layers, each layer storing float4 state.
+      const createLayeredTexture = (width, height) =>
+        device.createTexture({
+          size: [width, height, 4],
+          format: "rgba32float",
+          usage:
+            GPUTextureUsage.COPY_SRC |
+            GPUTextureUsage.COPY_DST |
+            GPUTextureUsage.TEXTURE_BINDING |
+            GPUTextureUsage.STORAGE_BINDING,
+          dimension: "2d",
+        });
+
+      // Uniform buffer layout matches `struct U` (vec4 + u32 + padding).
+      const uniformBuffer = device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      const uniformBytes = new ArrayBuffer(32);
+      const uniformFloat = new Float32Array(uniformBytes);
+      const uniformUint = new Uint32Array(uniformBytes);
+
+      // Bind-group helper: always prepend uniform at binding 0.
+      const createBindGroup = (pipeline, entries) =>
+        device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: { buffer: uniformBuffer } }, ...entries],
+        });
+
+      /*
+        Create all bind groups needed for one frame ordering:
+        - Compute 1 reads source layers, writes destination layer 0.
+        - Compute 2 reads destination layer 0 + source layers, writes destination layer 1.
+        - Compute 3 reads destination layers 0/1 + source layers 2/3, writes destination layers 3/2.
+        - Render reads destination layers 1/2.
+      */
+      const createFrameBindSet = (sourceTexture, destinationTexture) => {
+        const createViews = (texture) =>
+          [0, 1, 2, 3].map((layerIndex) =>
+            texture.createView({
+              dimension: "2d",
+              baseArrayLayer: layerIndex,
+              arrayLayerCount: 1,
+            })
+          );
+
+        const sourceViews = createViews(sourceTexture);
+        const destinationViews = createViews(destinationTexture);
+        const entry = (binding, resource) => ({ binding, resource });
+
+        return [
+          createBindGroup(flowPipeline, [
+            entry(1, sourceViews[0]),
+            entry(2, sourceViews[1]),
+            entry(3, sourceViews[2]),
+            entry(5, destinationViews[0]),
+          ]),
+          createBindGroup(particlePipeline, [
+            entry(1, destinationViews[0]),
+            entry(2, sourceViews[1]),
+            entry(3, sourceViews[2]),
+            entry(5, destinationViews[1]),
+          ]),
+          createBindGroup(dyePipeline, [
+            entry(1, destinationViews[1]),
+            entry(2, destinationViews[0]),
+            entry(3, sourceViews[3]),
+            entry(4, sourceViews[2]),
+            entry(5, destinationViews[3]),
+            entry(6, destinationViews[2]),
+          ]),
+          createBindGroup(renderPipeline, [
+            entry(1, destinationViews[1]),
+            entry(2, destinationViews[2]),
+          ]),
+        ];
+      };
+
+      // Pointer state packed into uniform each frame.
+      let mouseX = 0;
+      let mouseY = 0;
+      let mouseDown = 0;
+
+      const updatePointer = (event, downValue) => {
+        mouseX = event.clientX * devicePixelRatio;
+        mouseY = event.clientY * devicePixelRatio;
+        mouseDown = downValue;
+      };
+
+      window.addEventListener("pointerdown", (event) => updatePointer(event, 1));
+      window.addEventListener("pointermove", (event) => {
+        if (mouseDown) {
+          updatePointer(event, 1);
+        }
+      });
+      window.addEventListener("pointerup", () => {
+        mouseDown = 0;
+      });
+
+      // Compute the canvas target size in physical pixels.
+      const getTargetCanvasSize = () => {
+        const pixelRatio = devicePixelRatio || 1;
+        return {
+          targetWidth: math.max(1, innerWidth * pixelRatio) | 0,
+          targetHeight: math.max(1, innerHeight * pixelRatio) | 0,
+        };
+      };
+
+      /*
+        Shared path for first-time creation and later resize:
+        - Resize canvas and recompute dispatch dimensions.
+        - Allocate fresh ping/pong textures.
+        - Copy overlapping region from previous textures when available.
+        - Rebuild bind groups against the new texture views.
+      */
+      const initializeOrResizeSimulation = (targetWidth, targetHeight) => {
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+
+        canvasWidth = targetWidth;
+        canvasHeight = targetHeight;
+        workgroupsX = math.ceil(canvasWidth / 16);
+        workgroupsY = math.ceil(canvasHeight / 16);
+
+        const textureA = createLayeredTexture(canvasWidth, canvasHeight);
+        const textureB = createLayeredTexture(canvasWidth, canvasHeight);
+        const resizeEncoder = device.createCommandEncoder();
+
+        const hasPreviousTextures =
+          layeredTextures.length === 2 && layeredTextures[0] && layeredTextures[1];
+        const oldTextures = hasPreviousTextures
+          ? [layeredTextures[0], layeredTextures[1]]
+          : null;
+        const copyWidth = math.min(previousTextureWidth, canvasWidth);
+        const copyHeight = math.min(previousTextureHeight, canvasHeight);
+
+        if (hasPreviousTextures && copyWidth > 0 && copyHeight > 0) {
+          // Copy from the currently "live" source state so resize keeps continuity.
+          const liveSourceTexture = oldTextures[pingPongIndex];
+          resizeEncoder.copyTextureToTexture(
+            { texture: liveSourceTexture },
+            { texture: textureA },
+            { width: copyWidth, height: copyHeight, depthOrArrayLayers: 4 }
+          );
+          resizeEncoder.copyTextureToTexture(
+            { texture: liveSourceTexture },
+            { texture: textureB },
+            { width: copyWidth, height: copyHeight, depthOrArrayLayers: 4 }
+          );
+        }
+
+        queue.submit([resizeEncoder.finish()]);
+        layeredTextures = [textureA, textureB];
+        previousTextureWidth = canvasWidth;
+        previousTextureHeight = canvasHeight;
+        pingPongIndex = 0;
+
+        // Build bind sets for both ping/pong directions.
+        frameBindSets = [
+          createFrameBindSet(layeredTextures[0], layeredTextures[1]),
+          createFrameBindSet(layeredTextures[1], layeredTextures[0]),
+        ];
+
+        // Destroy old textures only after queued copy work is guaranteed complete.
+        if (oldTextures) {
+          queue
+            .onSubmittedWorkDone()
+            .then(() => {
+              oldTextures[0].destroy();
+              oldTextures[1].destroy();
+            })
+            .catch(() => {
+              // If the queue/device is lost, cleanup is handled by the runtime.
+            });
+        }
+      };
+
+      // Keep simulation resources in sync with viewport size.
+      const syncSimulationSize = () => {
+        const { targetWidth, targetHeight } = getTargetCanvasSize();
+        if (
+          canvas.width !== targetWidth ||
+          canvas.height !== targetHeight ||
+          frameBindSets.length === 0
+        ) {
+          initializeOrResizeSimulation(targetWidth, targetHeight);
+        }
+      };
+
+      // Main loop: resize check, simulation passes, then final render pass.
+      const frame = () => {
+        syncSimulationSize();
+
+        // Update uniform values for this frame.
+        uniformFloat[0] = math.min(mouseX, canvasWidth - 1);
+        uniformFloat[1] = math.min(mouseY, canvasHeight - 1);
+        uniformFloat[2] = mouseDown;
+        uniformUint[4] = frameIndex;
+        queue.writeBuffer(uniformBuffer, 0, uniformBytes);
+
+        // Encode all GPU work for this frame.
+        const bindSet = frameBindSets[pingPongIndex];
+        const commandEncoder = device.createCommandEncoder();
+
+        const computePass = commandEncoder.beginComputePass();
+        computePass.setPipeline(flowPipeline);
+        computePass.setBindGroup(0, bindSet[0]);
+        computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
+
+        computePass.setPipeline(particlePipeline);
+        computePass.setBindGroup(0, bindSet[1]);
+        computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
+
+        computePass.setPipeline(dyePipeline);
+        computePass.setBindGroup(0, bindSet[2]);
+        computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
+        computePass.end();
+
+        const renderPass = commandEncoder.beginRenderPass({
+          colorAttachments: [
+            {
+              view: context.getCurrentTexture().createView(),
+              loadOp: "clear",
+              storeOp: "store",
+            },
+          ],
+        });
+        renderPass.setPipeline(renderPipeline);
+        renderPass.setBindGroup(0, bindSet[3]);
+        renderPass.draw(3);
+        renderPass.end();
+
+        // Flip ping/pong and request next frame.
+        pingPongIndex ^= 1;
+        frameIndex += 1;
+        queue.submit([commandEncoder.finish()]);
+        requestAnimationFrame(frame);
+      };
+
+      frame();
+    })();
+  </script>
+</body>
+</html>
