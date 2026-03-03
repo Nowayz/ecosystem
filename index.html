@@ -799,13 +799,15 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
         // Update HUD at a modest cadence to avoid unnecessary string churn.
         if (timestamp - lastHudUpdateTimestamp > 120) {
           const fps = 1000 / math.max(smoothedFrameMs, 0.0001);
-          const rect = canvas.getBoundingClientRect();
-          const cssWidth = math.max(1, math.round(rect.width));
-          const cssHeight = math.max(1, math.round(rect.height));
+          const dpr = devicePixelRatio || 1;
+          const viewportCssWidth = math.max(1, math.round(innerWidth));
+          const viewportCssHeight = math.max(1, math.round(innerHeight));
+          const viewportPhysicalWidth = math.max(1, math.round(viewportCssWidth * dpr));
+          const viewportPhysicalHeight = math.max(1, math.round(viewportCssHeight * dpr));
           hud.textContent =
             `FPS: ${fps.toFixed(1)}` +
             `\nSim: ${canvasWidth} x ${canvasHeight}` +
-            `\nView: ${cssWidth} x ${cssHeight}`;
+            `\nView: ${viewportPhysicalWidth} x ${viewportPhysicalHeight}`;
           lastHudUpdateTimestamp = timestamp;
         }
 
