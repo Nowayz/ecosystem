@@ -67,6 +67,9 @@
     const canvas = document.getElementById("c");
     const hud = document.getElementById("hud");
     const math = Math;
+    const isAppleMobile =
+      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
     // Fixed simulation resolution: 1 simulation pixel per 2 real device pixels.
     const DEVICE_PIXELS_PER_SIM_PIXEL = 2;
     const WORKGROUP_SIZE_CANDIDATES = [8, 16];
@@ -100,7 +103,12 @@
     (async () => {
       // WebGPU bootstrap.
       const gpu = navigator.gpu;
-      const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+      const adapter =
+        (await gpu.requestAdapter({ powerPreference: "high-performance" })) ||
+        (await gpu.requestAdapter());
+      if (!adapter) {
+        throw new Error("No WebGPU adapter available.");
+      }
       const device = await adapter.requestDevice();
       const queue = device.queue;
 
@@ -111,6 +119,8 @@
         format: canvasFormat,
         alphaMode: "premultiplied",
       });
+      // iPhone/iPad GPUs are more stable with explicit clear on swapchain textures.
+      const renderLoadOp = isAppleMobile ? "clear" : "load";
 
       // Texture usage for simulation state buffers.
       const textureUsage =
@@ -669,9 +679,11 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
         - This keeps scaling at an exact integer ratio and avoids fractional blur.
       */
       const getTargetCanvasSize = () => {
+        const viewportWidthCss = window.visualViewport?.width ?? innerWidth;
+        const viewportHeightCss = window.visualViewport?.height ?? innerHeight;
         const deviceRatio = devicePixelRatio || 1;
-        const physicalWidth = math.max(1, math.round(innerWidth * deviceRatio));
-        const physicalHeight = math.max(1, math.round(innerHeight * deviceRatio));
+        const physicalWidth = math.max(1, math.round(viewportWidthCss * deviceRatio));
+        const physicalHeight = math.max(1, math.round(viewportHeightCss * deviceRatio));
 
         const alignedPhysicalWidth = math.max(
           DEVICE_PIXELS_PER_SIM_PIXEL,
@@ -847,8 +859,9 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
           colorAttachments: [
             {
               view: context.getCurrentTexture().createView(),
-              // Full-screen triangle writes every output pixel, so no pre-clear is needed.
-              loadOp: "load",
+              // "load" is fastest, but iOS is more robust with "clear" during dynamic viewport changes.
+              loadOp: renderLoadOp,
+              clearValue: { r: 0, g: 0, b: 0, a: 1 },
               storeOp: "store",
             },
           ],
