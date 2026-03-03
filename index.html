@@ -99,6 +99,11 @@
     let smoothedFrameMs = 16.67;
     let lastFrameTimestamp = performance.now();
     let lastHudUpdateTimestamp = 0;
+    let lastDisplayedFps = -1;
+    let lastDisplayedSimWidth = -1;
+    let lastDisplayedSimHeight = -1;
+    let lastDisplayedViewWidth = -1;
+    let lastDisplayedViewHeight = -1;
 
     (async () => {
       // WebGPU bootstrap.
@@ -811,15 +816,31 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
         // Update HUD at a modest cadence to avoid unnecessary string churn.
         if (timestamp - lastHudUpdateTimestamp > 120) {
           const fps = 1000 / math.max(smoothedFrameMs, 0.0001);
+          const roundedFps = math.round(fps);
           const dpr = devicePixelRatio || 1;
           const viewportCssWidth = math.max(1, math.round(innerWidth));
           const viewportCssHeight = math.max(1, math.round(innerHeight));
           const viewportPhysicalWidth = math.max(1, math.round(viewportCssWidth * dpr));
           const viewportPhysicalHeight = math.max(1, math.round(viewportCssHeight * dpr));
-          hud.textContent =
-            `FPS: ${fps.toFixed(1)}` +
-            `\nSim: ${canvasWidth} x ${canvasHeight}` +
-            `\nView: ${viewportPhysicalWidth} x ${viewportPhysicalHeight}`;
+
+          const hudChanged =
+            roundedFps !== lastDisplayedFps ||
+            canvasWidth !== lastDisplayedSimWidth ||
+            canvasHeight !== lastDisplayedSimHeight ||
+            viewportPhysicalWidth !== lastDisplayedViewWidth ||
+            viewportPhysicalHeight !== lastDisplayedViewHeight;
+
+          if (hudChanged) {
+            hud.textContent =
+              `FPS: ${roundedFps}` +
+              `\nSim: ${canvasWidth} x ${canvasHeight}` +
+              `\nView: ${viewportPhysicalWidth} x ${viewportPhysicalHeight}`;
+            lastDisplayedFps = roundedFps;
+            lastDisplayedSimWidth = canvasWidth;
+            lastDisplayedSimHeight = canvasHeight;
+            lastDisplayedViewWidth = viewportPhysicalWidth;
+            lastDisplayedViewHeight = viewportPhysicalHeight;
+          }
           lastHudUpdateTimestamp = timestamp;
         }
 
