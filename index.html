@@ -2,23 +2,60 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Biofluid SPA</title>
   <style>
-    /* Full-viewport canvas with no scrollbars. */
+    /* Full-viewport layout with no scrollbars. */
     html,
-    body,
-    canvas {
+    body {
       margin: 0;
       width: 100%;
       height: 100%;
-      display: block;
       background: #000;
       overflow: hidden;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overscroll-behavior: none;
+      touch-action: none;
+    }
+
+    /* Canvas is dynamically sized in JS to keep integer pixel scaling. */
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      touch-action: none;
+    }
+
+    /* Lightweight performance + resolution HUD. */
+    #hud {
+      position: fixed;
+      top: calc(env(safe-area-inset-top, 0px) + 10px);
+      left: calc(env(safe-area-inset-left, 0px) + 10px);
+      z-index: 10;
+      pointer-events: none;
+      color: #e9f2ff;
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: clamp(11px, 2.8vw, 13px);
+      line-height: 1.3;
+      letter-spacing: 0.02em;
+      white-space: pre;
     }
   </style>
 </head>
 <body>
   <canvas id="c"></canvas>
+  <div id="hud">FPS: --\nSim: -- x --</div>
   <script type="module">
     /*
       This page is a single-page WebGPU simulation:
@@ -28,7 +65,15 @@
     */
 
     const canvas = document.getElementById("c");
+    const hud = document.getElementById("hud");
     const math = Math;
+    // Fixed simulation resolution: 1 simulation pixel per 2 real device pixels.
+    const DEVICE_PIXELS_PER_SIM_PIXEL = 2;
+    const WORKGROUP_SIZE_CANDIDATES = [8, 16];
+    const BENCHMARK_STEPS = 8;
+    const ADAPTIVE_HIGH_MS = 21;
+    const ADAPTIVE_LOW_MS = 15;
+    const MAX_SIMULATION_STEP_INTERVAL = 2;
 
     // Canvas and dispatch sizing.
     let canvasWidth = 0;
@@ -44,7 +89,13 @@
 
     // Per-frame counters and bind-group caches.
     let frameIndex = 0;
-    let frameBindSets = [];
+    let simulationFrameIndex = 0;
+    let computeBindSets = [];
+    let renderBindGroups = [];
+    let adaptiveStepInterval = 1;
+    let smoothedFrameMs = 16.67;
+    let lastFrameTimestamp = performance.now();
+    let lastHudUpdateTimestamp = 0;
 
     (async () => {
       // WebGPU bootstrap.
@@ -61,6 +112,18 @@
         alphaMode: "premultiplied",
       });
 
+      // Texture usage for simulation state buffers.
+      const textureUsage =
+        GPUTextureUsage.COPY_SRC |
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.STORAGE_BINDING;
+
+      // Force full precision to preserve original look.
+      const stateTextureFormat = "rgba32float";
+      const useFilteredSampling = false;
+      const linearSampler = null;
+
       /*
         WGSL shader module organization:
         - `fF`: Fluid integration / force update.
@@ -74,7 +137,7 @@
         - Layer 2: display color field
         - Layer 3: previous color field (used by dye stage)
       */
-      const shaderCode = `
+      const createShaderCode = (workgroupSize) => `
 struct U {
   // m.xy = pointer position in pixels, m.z = pointer-down flag.
   m: vec4f,
@@ -87,8 +150,9 @@ struct U {
 @group(0) @binding(2) var t2: texture_2d<f32>;
 @group(0) @binding(3) var t3: texture_2d<f32>;
 @group(0) @binding(4) var t4: texture_2d<f32>;
-@group(0) @binding(5) var o1: texture_storage_2d<rgba32float, write>;
-@group(0) @binding(6) var o2: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(5) var o1: texture_storage_2d<${stateTextureFormat}, write>;
+@group(0) @binding(6) var o2: texture_storage_2d<${stateTextureFormat}, write>;
+${useFilteredSampling ? "@group(0) @binding(7) var sLinear: sampler;" : ""}
 
 // Hash-like deterministic pseudo-random vector in [-1, 1].
 fn H(p: f32) -> vec4f {
@@ -102,6 +166,17 @@ fn R(s: f32) -> bool {
   return fract(s * 97.13) > .985;
 }
 
+${useFilteredSampling
+    ? `
+// Fast bilinear sample helper using hardware filtering.
+fn cS(t: texture_2d<f32>, P: vec2f) -> vec4f {
+  let d = vec2f(textureDimensions(t));
+  let halfTexel = vec2f(.5) / d;
+  let uv = clamp(P / d, halfTexel, vec2f(1.) - halfTexel);
+  return textureSampleLevel(t, sLinear, uv, 0.);
+}
+`
+    : `
 // Clamp-safe load for integer texel coordinates.
 fn L(t: texture_2d<f32>, p: vec2i) -> vec4f {
   return textureLoad(
@@ -122,6 +197,7 @@ fn cS(t: texture_2d<f32>, P: vec2f) -> vec4f {
     f.y
   );
 }
+`}
 
 // Semi-Lagrangian advection step: sample from backtraced coordinates.
 fn T(t: texture_2d<f32>, U: vec2f) -> vec4f {
@@ -135,21 +211,14 @@ fn hS(p: vec2i) -> f32 {
   return f32(n ^ (n >> 16u)) / 4294967295.;
 }
 
-// Time-varying diffusion direction tied to particle id + position + frame index.
-// This intentionally de-synchronizes motion so clusters do not all drift the same way.
+// Hash-driven diffusion direction (no trig) to reduce ALU cost.
 fn pD(seed: f32, pos: vec2f, frame: u32) -> vec2f {
-  let h = H(seed);
-  let axis = normalize(h.xy + vec2f(1e-5, -1e-5));
-  let speed = .018 + .028 * abs(h.z);
-  let freq = .035 + .055 * abs(h.w);
-  let phase = dot(pos, axis * freq) + f32(frame) * speed + h.x * 6.2831853;
-  let wave = vec2f(cos(phase), sin(phase));
-  let cross = vec2f(-axis.y, axis.x) * sin(phase * .73 + h.y * 4.2);
-  return normalize(wave + .65 * cross + axis * .25);
+  let n = H(seed + dot(pos, vec2f(.0113, -.0097)) + f32(frame) * .013);
+  return normalize(n.xy + .35 * n.zw + vec2f(1e-5, -1e-5));
 }
 
 // Compute stage 1: evolve the primary flow field.
-@compute @workgroup_size(16, 16)
+@compute @workgroup_size(${workgroupSize}, ${workgroupSize})
 fn fF(@builtin(global_invocation_id) g: vec3u) {
   let d = textureDimensions(t1);
   if (g.x >= d.x || g.y >= d.y) {
@@ -218,7 +287,7 @@ fn fF(@builtin(global_invocation_id) g: vec3u) {
 }
 
 // Compute stage 2: update particle ownership/identity and spawn new seeds.
-@compute @workgroup_size(16, 16)
+@compute @workgroup_size(${workgroupSize}, ${workgroupSize})
 fn fP(@builtin(global_invocation_id) g: vec3u) {
   let d = textureDimensions(t2);
   if (g.x >= d.x || g.y >= d.y) {
@@ -240,15 +309,20 @@ fn fP(@builtin(global_invocation_id) g: vec3u) {
     vec2f(-2, 2),
     vec2f(-2, -2)
   );
+  var bestDist2 = dot(U - Q.xy, U - Q.xy);
   for (var j = 0; j < 8; j++) {
     let n = cS(t2, U + O[j]);
-    if (distance(U, n.xy) < distance(U, Q.xy)) {
+    let delta = U - n.xy;
+    let dist2 = dot(delta, delta);
+    if (dist2 < bestDist2) {
       Q = n;
+      bestDist2 = dist2;
     }
   }
 
+  let dyeAtU = cS(t3, U);
   // Re-randomize identity if appearance becomes too similar to local dye.
-  if (length(H(Q.w) - cS(t3, U)) < .1) {
+  if (length(H(Q.w) - dyeAtU) < .1) {
     Q.w = dot(H(Q.w), vec4f(1e3));
   }
 
@@ -262,18 +336,19 @@ fn fP(@builtin(global_invocation_id) g: vec3u) {
     fract(abs(idHash.x) * 91.73 + abs(idHash.z) * 47.11) > .38
   );
   let diffusionVector = pD(Q.w, U, u.f);
-  let flowScale = .75 + 1.15 * smoothstep(.02, .45, length(baseFlow));
-  let diffusionStrength = (.03 + .085 * abs(idHash.w)) * diffuseMask * flowScale;
+  let flowScale = .45 + .6 * smoothstep(.02, .45, length(baseFlow));
+  let diffusionStrength = (.012 + .03 * abs(idHash.w)) * diffuseMask * flowScale;
 
   // Bias a broad subset of particles to drift from bottom-left toward top-right.
   let diagonalDirection = normalize(vec2f(1., -1.));
   let diagonalMask = select(
     0.,
     1.,
-    fract(abs(idHash.y) * 73.1 + abs(idHash.w) * 31.7) > .33
+    fract(abs(idHash.y) * 73.1 + abs(idHash.w) * 31.7) > .58
   );
-  let diagonalPulse = .35 + .65 * (.5 + .5 * sin(dot(U, vec2f(.0105, -.0085)) + f32(u.f) * .019 + idHash.y * 3.7));
-  let diagonalStrength = (.022 + .075 * abs(idHash.x)) * diagonalMask * diagonalPulse;
+  let pulseSeed = abs(dot(U, vec2f(.0105, -.0085)) + f32(u.f) * .019 + idHash.y * 3.7);
+  let diagonalPulse = .6 + .25 * fract(pulseSeed * .75487766 + abs(idHash.z) * .24512234);
+  let diagonalStrength = (.008 + .025 * abs(idHash.x)) * diagonalMask * diagonalPulse;
 
   Q += vec4f(baseFlow + diffusionVector * diffusionStrength + diagonalDirection * diagonalStrength, 0, 0);
 
@@ -295,7 +370,7 @@ fn fP(@builtin(global_invocation_id) g: vec3u) {
 
   // Special particles receive additional swirl + emissive behavior.
   if (R(Q.w)) {
-    Q += vec4f(normalize(H(Q.w).yz - .5) * .08, .004 * length(cS(t3, U).xyz), .002);
+    Q += vec4f(normalize(H(Q.w).yz - .5) * .035, .0015 * length(dyeAtU.xyz), .001);
   }
 
   textureStore(o1, i, Q);
@@ -317,7 +392,7 @@ fn dC(t: texture_2d<f32>, U: vec2f, b: vec4f) -> vec4f {
 }
 
 // Compute stage 3: advect current and previous dye buffers.
-@compute @workgroup_size(16, 16)
+@compute @workgroup_size(${workgroupSize}, ${workgroupSize})
 fn fD(@builtin(global_invocation_id) g: vec3u) {
   let d = textureDimensions(t3);
   if (g.x >= d.x || g.y >= d.y) {
@@ -374,40 +449,40 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
 }
 `;
 
-      const shaderModule = device.createShaderModule({ code: shaderCode });
+      const createPipelineSet = (workgroupSize) => {
+        const shaderModule = device.createShaderModule({ code: createShaderCode(workgroupSize) });
+        const createComputePipeline = (entryPoint) =>
+          device.createComputePipeline({
+            layout: "auto",
+            compute: { module: shaderModule, entryPoint },
+          });
+        return {
+          workgroupSize,
+          flowPipeline: createComputePipeline("fF"),
+          particlePipeline: createComputePipeline("fP"),
+          dyePipeline: createComputePipeline("fD"),
+          renderPipeline: device.createRenderPipeline({
+            layout: "auto",
+            vertex: { module: shaderModule, entryPoint: "vs" },
+            fragment: {
+              module: shaderModule,
+              entryPoint: "fs",
+              targets: [{ format: canvasFormat }],
+            },
+            primitive: { topology: "triangle-list" },
+          }),
+        };
+      };
 
-      // Helper to build compute pipelines from a shader entry point.
-      const createComputePipeline = (entryPoint) =>
-        device.createComputePipeline({
-          layout: "auto",
-          compute: { module: shaderModule, entryPoint },
-        });
-
-      const flowPipeline = createComputePipeline("fF");
-      const particlePipeline = createComputePipeline("fP");
-      const dyePipeline = createComputePipeline("fD");
-
-      const renderPipeline = device.createRenderPipeline({
-        layout: "auto",
-        vertex: { module: shaderModule, entryPoint: "vs" },
-        fragment: {
-          module: shaderModule,
-          entryPoint: "fs",
-          targets: [{ format: canvasFormat }],
-        },
-        primitive: { topology: "triangle-list" },
-      });
+      const pipelineSets = WORKGROUP_SIZE_CANDIDATES.map(createPipelineSet);
+      let activePipelineSet = pipelineSets[0];
 
       // Creates a 2D texture with 4 array layers, each layer storing float4 state.
       const createLayeredTexture = (width, height) =>
         device.createTexture({
           size: [width, height, 4],
-          format: "rgba32float",
-          usage:
-            GPUTextureUsage.COPY_SRC |
-            GPUTextureUsage.COPY_DST |
-            GPUTextureUsage.TEXTURE_BINDING |
-            GPUTextureUsage.STORAGE_BINDING,
+          format: stateTextureFormat,
+          usage: textureUsage,
           dimension: "2d",
         });
 
@@ -427,54 +502,139 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
           entries: [{ binding: 0, resource: { buffer: uniformBuffer } }, ...entries],
         });
 
-      /*
-        Create all bind groups needed for one frame ordering:
-        - Compute 1 reads source layers, writes destination layer 0.
-        - Compute 2 reads destination layer 0 + source layers, writes destination layer 1.
-        - Compute 3 reads destination layers 0/1 + source layers 2/3, writes destination layers 3/2.
-        - Render reads destination layers 1/2.
-      */
-      const createFrameBindSet = (sourceTexture, destinationTexture) => {
-        const createViews = (texture) =>
-          [0, 1, 2, 3].map((layerIndex) =>
-            texture.createView({
-              dimension: "2d",
-              baseArrayLayer: layerIndex,
-              arrayLayerCount: 1,
-            })
-          );
+      const createViewsForTexture = (texture) =>
+        [0, 1, 2, 3].map((layerIndex) =>
+          texture.createView({
+            dimension: "2d",
+            baseArrayLayer: layerIndex,
+            arrayLayerCount: 1,
+          })
+        );
 
-        const sourceViews = createViews(sourceTexture);
-        const destinationViews = createViews(destinationTexture);
+      const addSamplerEntryIfNeeded = (entries, entry) => {
+        if (linearSampler) {
+          entries.push(entry(7, linearSampler));
+        }
+        return entries;
+      };
+
+      /*
+        Build compute and render bind groups:
+        - computeBindSets[0]: source A -> destination B
+        - computeBindSets[1]: source B -> destination A
+        - renderBindGroups[i]: render current live state from texture i
+      */
+      const createSimulationBindings = (pipelineSet, textureA, textureB) => {
+        const viewsA = createViewsForTexture(textureA);
+        const viewsB = createViewsForTexture(textureB);
         const entry = (binding, resource) => ({ binding, resource });
 
-        return [
-          createBindGroup(flowPipeline, [
-            entry(1, sourceViews[0]),
-            entry(2, sourceViews[1]),
-            entry(3, sourceViews[2]),
-            entry(5, destinationViews[0]),
-          ]),
-          createBindGroup(particlePipeline, [
-            entry(1, destinationViews[0]),
-            entry(2, sourceViews[1]),
-            entry(3, sourceViews[2]),
-            entry(5, destinationViews[1]),
-          ]),
-          createBindGroup(dyePipeline, [
-            entry(1, destinationViews[1]),
-            entry(2, destinationViews[0]),
-            entry(3, sourceViews[3]),
-            entry(4, sourceViews[2]),
-            entry(5, destinationViews[3]),
-            entry(6, destinationViews[2]),
-          ]),
-          createBindGroup(renderPipeline, [
-            entry(1, destinationViews[1]),
-            entry(2, destinationViews[2]),
-          ]),
+        const makeComputeSet = (sourceViews, destinationViews) => [
+          createBindGroup(
+            pipelineSet.flowPipeline,
+            addSamplerEntryIfNeeded(
+              [
+                entry(1, sourceViews[0]),
+                entry(2, sourceViews[1]),
+                entry(3, sourceViews[2]),
+                entry(5, destinationViews[0]),
+              ],
+              entry
+            )
+          ),
+          createBindGroup(
+            pipelineSet.particlePipeline,
+            addSamplerEntryIfNeeded(
+              [
+                entry(1, destinationViews[0]),
+                entry(2, sourceViews[1]),
+                entry(3, sourceViews[2]),
+                entry(5, destinationViews[1]),
+              ],
+              entry
+            )
+          ),
+          createBindGroup(
+            pipelineSet.dyePipeline,
+            addSamplerEntryIfNeeded(
+              [
+                entry(1, destinationViews[1]),
+                entry(2, destinationViews[0]),
+                entry(3, sourceViews[3]),
+                entry(4, sourceViews[2]),
+                entry(5, destinationViews[3]),
+                entry(6, destinationViews[2]),
+              ],
+              entry
+            )
+          ),
         ];
+
+        const makeRenderGroup = (views) =>
+          createBindGroup(pipelineSet.renderPipeline, [
+            entry(1, views[1]),
+            entry(2, views[2]),
+          ]);
+
+        return {
+          computeSets: [makeComputeSet(viewsA, viewsB), makeComputeSet(viewsB, viewsA)],
+          renderGroups: [makeRenderGroup(viewsA), makeRenderGroup(viewsB)],
+        };
       };
+
+      // Benchmark compute throughput and pick the fastest workgroup size on this GPU.
+      const benchmarkPipelineSet = async () => {
+        if (pipelineSets.length === 1) {
+          return pipelineSets[0];
+        }
+
+        const benchWidth = 256;
+        const benchHeight = 256;
+        let best = pipelineSets[0];
+        let bestTimeMs = Number.POSITIVE_INFINITY;
+
+        for (const set of pipelineSets) {
+          const texA = createLayeredTexture(benchWidth, benchHeight);
+          const texB = createLayeredTexture(benchWidth, benchHeight);
+          const bindings = createSimulationBindings(set, texA, texB);
+          const wgX = math.ceil(benchWidth / set.workgroupSize);
+          const wgY = math.ceil(benchHeight / set.workgroupSize);
+
+          let localPingPong = 0;
+          const start = performance.now();
+          for (let step = 0; step < BENCHMARK_STEPS; step++) {
+            const bindSet = bindings.computeSets[localPingPong];
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(set.flowPipeline);
+            pass.setBindGroup(0, bindSet[0]);
+            pass.dispatchWorkgroups(wgX, wgY);
+            pass.setPipeline(set.particlePipeline);
+            pass.setBindGroup(0, bindSet[1]);
+            pass.dispatchWorkgroups(wgX, wgY);
+            pass.setPipeline(set.dyePipeline);
+            pass.setBindGroup(0, bindSet[2]);
+            pass.dispatchWorkgroups(wgX, wgY);
+            pass.end();
+            queue.submit([encoder.finish()]);
+            localPingPong ^= 1;
+          }
+          await queue.onSubmittedWorkDone();
+          const elapsedMs = performance.now() - start;
+
+          texA.destroy();
+          texB.destroy();
+
+          if (elapsedMs < bestTimeMs) {
+            bestTimeMs = elapsedMs;
+            best = set;
+          }
+        }
+
+        return best;
+      };
+
+      activePipelineSet = await benchmarkPipelineSet();
 
       // Pointer state packed into uniform each frame.
       let mouseX = 0;
@@ -482,8 +642,14 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
       let mouseDown = 0;
 
       const updatePointer = (event, downValue) => {
-        mouseX = event.clientX * devicePixelRatio;
-        mouseY = event.clientY * devicePixelRatio;
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+          return;
+        }
+
+        // Map pointer from displayed canvas space to simulation texture space.
+        mouseX = (event.clientX - rect.left) * (canvasWidth / rect.width);
+        mouseY = (event.clientY - rect.top) * (canvasHeight / rect.height);
         mouseDown = downValue;
       };
 
@@ -497,12 +663,30 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
         mouseDown = 0;
       });
 
-      // Compute the canvas target size in physical pixels.
+      /*
+        Compute an integer-aligned simulation size:
+        - We snap physical pixel dimensions down to a multiple of the fixed scale.
+        - This keeps scaling at an exact integer ratio and avoids fractional blur.
+      */
       const getTargetCanvasSize = () => {
-        const pixelRatio = devicePixelRatio || 1;
+        const deviceRatio = devicePixelRatio || 1;
+        const physicalWidth = math.max(1, math.round(innerWidth * deviceRatio));
+        const physicalHeight = math.max(1, math.round(innerHeight * deviceRatio));
+
+        const alignedPhysicalWidth = math.max(
+          DEVICE_PIXELS_PER_SIM_PIXEL,
+          physicalWidth - (physicalWidth % DEVICE_PIXELS_PER_SIM_PIXEL)
+        );
+        const alignedPhysicalHeight = math.max(
+          DEVICE_PIXELS_PER_SIM_PIXEL,
+          physicalHeight - (physicalHeight % DEVICE_PIXELS_PER_SIM_PIXEL)
+        );
+
         return {
-          targetWidth: math.max(1, innerWidth * pixelRatio) | 0,
-          targetHeight: math.max(1, innerHeight * pixelRatio) | 0,
+          targetWidth: alignedPhysicalWidth / DEVICE_PIXELS_PER_SIM_PIXEL,
+          targetHeight: alignedPhysicalHeight / DEVICE_PIXELS_PER_SIM_PIXEL,
+          cssWidth: alignedPhysicalWidth / deviceRatio,
+          cssHeight: alignedPhysicalHeight / deviceRatio,
         };
       };
 
@@ -513,14 +697,17 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
         - Copy overlapping region from previous textures when available.
         - Rebuild bind groups against the new texture views.
       */
-      const initializeOrResizeSimulation = (targetWidth, targetHeight) => {
+      const initializeOrResizeSimulation = (targetWidth, targetHeight, cssWidth, cssHeight) => {
+        // Apply exact CSS presentation size that matches aligned physical dimensions.
+        canvas.style.width = `${cssWidth}px`;
+        canvas.style.height = `${cssHeight}px`;
         canvas.width = targetWidth;
         canvas.height = targetHeight;
 
         canvasWidth = targetWidth;
         canvasHeight = targetHeight;
-        workgroupsX = math.ceil(canvasWidth / 16);
-        workgroupsY = math.ceil(canvasHeight / 16);
+        workgroupsX = math.ceil(canvasWidth / activePipelineSet.workgroupSize);
+        workgroupsY = math.ceil(canvasHeight / activePipelineSet.workgroupSize);
 
         const textureA = createLayeredTexture(canvasWidth, canvasHeight);
         const textureB = createLayeredTexture(canvasWidth, canvasHeight);
@@ -555,11 +742,14 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
         previousTextureHeight = canvasHeight;
         pingPongIndex = 0;
 
-        // Build bind sets for both ping/pong directions.
-        frameBindSets = [
-          createFrameBindSet(layeredTextures[0], layeredTextures[1]),
-          createFrameBindSet(layeredTextures[1], layeredTextures[0]),
-        ];
+        // Build bind groups for compute ping/pong + rendering from each live texture.
+        const bindings = createSimulationBindings(
+          activePipelineSet,
+          layeredTextures[0],
+          layeredTextures[1]
+        );
+        computeBindSets = bindings.computeSets;
+        renderBindGroups = bindings.renderGroups;
 
         // Destroy old textures only after queued copy work is guaranteed complete.
         if (oldTextures) {
@@ -577,67 +767,102 @@ fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
 
       // Keep simulation resources in sync with viewport size.
       const syncSimulationSize = () => {
-        const { targetWidth, targetHeight } = getTargetCanvasSize();
+        const { targetWidth, targetHeight, cssWidth, cssHeight } = getTargetCanvasSize();
         if (
           canvas.width !== targetWidth ||
           canvas.height !== targetHeight ||
-          frameBindSets.length === 0
+          computeBindSets.length === 0
         ) {
-          initializeOrResizeSimulation(targetWidth, targetHeight);
+          initializeOrResizeSimulation(targetWidth, targetHeight, cssWidth, cssHeight);
+        } else {
+          // Keep CSS size aligned when only browser zoom/device ratio changes.
+          canvas.style.width = `${cssWidth}px`;
+          canvas.style.height = `${cssHeight}px`;
         }
       };
 
       // Main loop: resize check, simulation passes, then final render pass.
-      const frame = () => {
+      const frame = (timestamp) => {
         syncSimulationSize();
+
+        const deltaMs = timestamp - lastFrameTimestamp;
+        lastFrameTimestamp = timestamp;
+        if (Number.isFinite(deltaMs) && deltaMs > 0 && deltaMs < 1000) {
+          smoothedFrameMs = smoothedFrameMs * 0.9 + deltaMs * 0.1;
+        }
+        if (smoothedFrameMs > ADAPTIVE_HIGH_MS) {
+          adaptiveStepInterval = MAX_SIMULATION_STEP_INTERVAL;
+        } else if (smoothedFrameMs < ADAPTIVE_LOW_MS) {
+          adaptiveStepInterval = 1;
+        }
+
+        // Update HUD at a modest cadence to avoid unnecessary string churn.
+        if (timestamp - lastHudUpdateTimestamp > 120) {
+          const fps = 1000 / math.max(smoothedFrameMs, 0.0001);
+          const rect = canvas.getBoundingClientRect();
+          const cssWidth = math.max(1, math.round(rect.width));
+          const cssHeight = math.max(1, math.round(rect.height));
+          hud.textContent =
+            `FPS: ${fps.toFixed(1)}` +
+            `\nSim: ${canvasWidth} x ${canvasHeight}` +
+            `\nView: ${cssWidth} x ${cssHeight}`;
+          lastHudUpdateTimestamp = timestamp;
+        }
 
         // Update uniform values for this frame.
         uniformFloat[0] = math.min(mouseX, canvasWidth - 1);
         uniformFloat[1] = math.min(mouseY, canvasHeight - 1);
         uniformFloat[2] = mouseDown;
-        uniformUint[4] = frameIndex;
+        uniformUint[4] = simulationFrameIndex;
         queue.writeBuffer(uniformBuffer, 0, uniformBytes);
 
         // Encode all GPU work for this frame.
-        const bindSet = frameBindSets[pingPongIndex];
         const commandEncoder = device.createCommandEncoder();
+        const shouldSimulate = frameIndex % adaptiveStepInterval === 0;
 
-        const computePass = commandEncoder.beginComputePass();
-        computePass.setPipeline(flowPipeline);
-        computePass.setBindGroup(0, bindSet[0]);
-        computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
+        if (shouldSimulate) {
+          const bindSet = computeBindSets[pingPongIndex];
+          const computePass = commandEncoder.beginComputePass();
+          computePass.setPipeline(activePipelineSet.flowPipeline);
+          computePass.setBindGroup(0, bindSet[0]);
+          computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-        computePass.setPipeline(particlePipeline);
-        computePass.setBindGroup(0, bindSet[1]);
-        computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
+          computePass.setPipeline(activePipelineSet.particlePipeline);
+          computePass.setBindGroup(0, bindSet[1]);
+          computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-        computePass.setPipeline(dyePipeline);
-        computePass.setBindGroup(0, bindSet[2]);
-        computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
-        computePass.end();
+          computePass.setPipeline(activePipelineSet.dyePipeline);
+          computePass.setBindGroup(0, bindSet[2]);
+          computePass.dispatchWorkgroups(workgroupsX, workgroupsY);
+          computePass.end();
+
+          // After compute, the destination becomes the new live texture.
+          pingPongIndex ^= 1;
+          simulationFrameIndex += 1;
+        }
 
         const renderPass = commandEncoder.beginRenderPass({
           colorAttachments: [
             {
               view: context.getCurrentTexture().createView(),
-              loadOp: "clear",
+              // Full-screen triangle writes every output pixel, so no pre-clear is needed.
+              loadOp: "load",
               storeOp: "store",
             },
           ],
         });
-        renderPass.setPipeline(renderPipeline);
-        renderPass.setBindGroup(0, bindSet[3]);
+        renderPass.setPipeline(activePipelineSet.renderPipeline);
+        renderPass.setBindGroup(0, renderBindGroups[pingPongIndex]);
         renderPass.draw(3);
         renderPass.end();
 
-        // Flip ping/pong and request next frame.
-        pingPongIndex ^= 1;
+        // Request next frame.
         frameIndex += 1;
         queue.submit([commandEncoder.finish()]);
         requestAnimationFrame(frame);
       };
 
-      frame();
+      requestAnimationFrame(frame);
     })();
   </script>
 </body>
